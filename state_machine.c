@@ -83,18 +83,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-/* die_unless is intended to work like assert, except that it happens
-   always, even if NDEBUG is defined. Use assert as a stopgap. */
-
-#define die_unless(x)	assert(x)
-
-typedef struct
-    {
-    SSL_CTX *pCtx;
-    BIO *pbioRead;
-    BIO *pbioWrite;
-    SSL *pSSL;
-    } SSLStateMachine;
+#include "state_machine.h"
 
 void SSLStateMachine_print_error(SSLStateMachine *pMachine,const char *szErr)
     {
@@ -111,14 +100,18 @@ void SSLStateMachine_print_error(SSLStateMachine *pMachine,const char *szErr)
     }
 
 SSLStateMachine *SSLStateMachine_new(const char *szCertificateFile,
-				     const char *szKeyFile)
+				     const char *szKeyFile, int isServer)
     {
     SSLStateMachine *pMachine=malloc(sizeof *pMachine);
     int n;
 
     die_unless(pMachine);
 
-    pMachine->pCtx=SSL_CTX_new(SSLv23_server_method());
+    if ( isServer )
+        pMachine->pCtx=SSL_CTX_new(SSLv23_server_method());
+    else
+        pMachine->pCtx=SSL_CTX_new(SSLv23_client_method());
+
     die_unless(pMachine->pCtx);
 
     n=SSL_CTX_use_certificate_file(pMachine->pCtx,szCertificateFile,
@@ -137,7 +130,10 @@ SSLStateMachine *SSLStateMachine_new(const char *szCertificateFile,
 
     SSL_set_bio(pMachine->pSSL,pMachine->pbioRead,pMachine->pbioWrite);
 
-    SSL_set_accept_state(pMachine->pSSL);
+    if ( isServer )
+        SSL_set_accept_state(pMachine->pSSL);
+    else
+        SSL_set_connect_state(pMachine->pSSL);
 
     return pMachine;
     }
@@ -233,184 +229,112 @@ void SSLStateMachine_write_inject(SSLStateMachine *pMachine,
     fprintf(stderr,"%d bytes of unencrypted data fed to state machine\n",n);
     }
 
-int OpenSocket(int nPort)
+void StateMachineEchoLoop(SSLStateMachine *pMachine, int socketFD)
     {
-    int nSocket;
-    struct sockaddr_in saServer;
-    struct sockaddr_in saClient;
-    int one=1;
-    int nSize;
-    int nFD;
-    socklen_t nLen;
-
-    nSocket=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
-    if(nSocket < 0)
-	{
-	perror("socket");
-	exit(1);
-	}
-
-    if(setsockopt(nSocket,SOL_SOCKET,SO_REUSEADDR,(char *)&one,sizeof one) < 0)
-	{
-	perror("setsockopt");
-        exit(2);
-	}
-
-    memset(&saServer,0,sizeof saServer);
-    saServer.sin_family=AF_INET;
-    saServer.sin_port=htons(nPort);
-    nSize=sizeof saServer;
-    if(bind(nSocket,(struct sockaddr *)&saServer,nSize) < 0)
-	{
-	perror("bind");
-	exit(3);
-	}
-
-    if(listen(nSocket,512) < 0)
-	{
-	perror("listen");
-	exit(4);
-	}
-
-    nLen=sizeof saClient;
-    nFD=accept(nSocket,(struct sockaddr *)&saClient,&nLen);
-    if(nFD < 0)
-	{
-	perror("accept");
-	exit(5);
-	}
-
-    fprintf(stderr,"Incoming accepted on port %d\n",nPort);
-
-    return nFD;
-    }
-
-int main(int argc,char **argv)
-    {
-    SSLStateMachine *pMachine;
-    int nPort;
-    int nFD;
-    const char *szCertificateFile;
-    const char *szKeyFile;
     unsigned char rbuf[1];
-    int nrbuf=0;
-
-    if(argc != 4)
-	{
-	fprintf(stderr,"%s <port> <certificate file> <key file>\n",argv[0]);
-	exit(6);
-	}
-
-    nPort=atoi(argv[1]);
-    szCertificateFile=argv[2];
-    szKeyFile=argv[3];
-
-    SSL_library_init();
-    OpenSSL_add_ssl_algorithms();
-    SSL_load_error_strings();
-    ERR_load_crypto_strings();
-
-    nFD=OpenSocket(nPort);
-
-    pMachine=SSLStateMachine_new(szCertificateFile,szKeyFile);
+    int nrbuf = 0;
 
     for( ; ; )
-	{
-	fd_set rfds,wfds;
-	unsigned char buf[1024];
-	int n;
+    {
+    fd_set rfds,wfds;
+    unsigned char buf[1024];
+    int n;
 
-	FD_ZERO(&rfds);
-	FD_ZERO(&wfds);
+    if ( ! SSL_is_init_finished(pMachine->pSSL) )
+        SSL_do_handshake(pMachine->pSSL);
 
-	/* Select socket for input */
-	FD_SET(nFD,&rfds);
+    /* TODO: SSL_get_verify_result() should be used to validate peer certs. */
 
-	/* check whether there's decrypted data */
-	if(!nrbuf)
-	    nrbuf=SSLStateMachine_read_extract(pMachine,rbuf,1);
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
 
-	/* if there's decrypted data, check whether we can write it */
-	if(nrbuf)
-	    FD_SET(1,&wfds);
+    /* Select socket for input */
+    FD_SET(socketFD,&rfds);
 
-	/* Select socket for output */
-	if(SSLStateMachine_write_can_extract(pMachine))
-	    FD_SET(nFD,&wfds);
+    /* check whether there's decrypted data */
+    if(!nrbuf)
+        nrbuf=SSLStateMachine_read_extract(pMachine,rbuf,1);
 
-	/* Select stdin for input */
-	FD_SET(0,&rfds);
+    /* if there's decrypted data, check whether we can write it */
+    if(nrbuf)
+        FD_SET(1,&wfds);
 
-	/* Wait for something to do something */
-	n=select(nFD+1,&rfds,&wfds,NULL,NULL);
-	assert(n > 0);
+    /* Select socket for output */
+    if(SSLStateMachine_write_can_extract(pMachine))
+        FD_SET(socketFD,&wfds);
 
-	/* Socket is ready for input */
-	if(FD_ISSET(nFD,&rfds))
-	    {
-	    n=read(nFD,buf,sizeof buf);
-	    if(n == 0)
-		{
-		fprintf(stderr,"Got EOF on socket\n");
-		exit(0);
-		}
-	    assert(n > 0);
+    /* Select stdin for input */
+    FD_SET(0,&rfds);
 
-	    SSLStateMachine_read_inject(pMachine,buf,n);
-	    }
+    /* Wait for something to do something */
+    n=select(socketFD+1,&rfds,&wfds,NULL,NULL);
+    assert(n > 0);
 
-	/* stdout is ready for output (and hence we have some to send it) */
-	if(FD_ISSET(1,&wfds))
-	    {
-	    assert(nrbuf == 1);
-	    buf[0]=rbuf[0];
-	    nrbuf=0;
+    /* Socket is ready for input */
+    if(FD_ISSET(socketFD,&rfds))
+        {
+        n=read(socketFD,buf,sizeof buf);
+        if(n == 0)
+        {
+        fprintf(stderr,"Got EOF on socket\n");
+        exit(0);
+        }
+        assert(n > 0);
 
-	    n=SSLStateMachine_read_extract(pMachine,buf+1,sizeof buf-1);
-	    if(n < 0)
-		{
-		SSLStateMachine_print_error(pMachine,"read extract failed");
-		break;
-		}
-	    assert(n >= 0);
-	    ++n;
-	    if(n > 0) /* FIXME: has to be true now */
-		{
-		int w;
-		
-		w=write(1,buf,n);
-		/* FIXME: we should push back any unwritten data */
-		assert(w == n);
-		}
-	    }
+        SSLStateMachine_read_inject(pMachine,buf,n);
+        }
 
-	/* Socket is ready for output (and therefore we have output to send) */
-	if(FD_ISSET(nFD,&wfds))
-	    {
-	    int w;
+    /* stdout is ready for output (and hence we have some to send it) */
+    if(FD_ISSET(1,&wfds))
+        {
+        assert(nrbuf == 1);
+        buf[0]=rbuf[0];
+        nrbuf=0;
 
-	    n=SSLStateMachine_write_extract(pMachine,buf,sizeof buf);
-	    assert(n > 0);
+        n=SSLStateMachine_read_extract(pMachine,buf+1,sizeof buf-1);
+        if(n < 0)
+        {
+        SSLStateMachine_print_error(pMachine,"read extract failed");
+        break;
+        }
+        assert(n >= 0);
+        ++n;
+        if(n > 0) /* FIXME: has to be true now */
+        {
+        int w;
 
-	    w=write(nFD,buf,n);
-	    /* FIXME: we should push back any unwritten data */
-	    assert(w == n);
-	    }
+        w=write(1,buf,n);
+        /* FIXME: we should push back any unwritten data */
+        assert(w == n);
+        }
+        }
 
-	/* Stdin is ready for input */
-	if(FD_ISSET(0,&rfds))
-	    {
-	    n=read(0,buf,sizeof buf);
-	    if(n == 0)
-		{
-		fprintf(stderr,"Got EOF on stdin\n");
-		exit(0);
-		}
-	    assert(n > 0);
+    /* Socket is ready for output (and therefore we have output to send) */
+    if(FD_ISSET(socketFD,&wfds))
+        {
+        int w;
 
-	    SSLStateMachine_write_inject(pMachine,buf,n);
-	    }
-	}
+        n=SSLStateMachine_write_extract(pMachine,buf,sizeof buf);
+        assert(n > 0);
+
+        w=write(socketFD,buf,n);
+        /* FIXME: we should push back any unwritten data */
+        assert(w == n);
+        }
+
+    /* Stdin is ready for input */
+    if(FD_ISSET(0,&rfds))
+        {
+        n=read(0,buf,sizeof buf);
+        if(n == 0)
+        {
+        fprintf(stderr,"Got EOF on stdin\n");
+        exit(0);
+        }
+        assert(n > 0);
+
+        SSLStateMachine_write_inject(pMachine,buf,n);
+        }
+    }
     /* not reached */
-    return 0;
     }
