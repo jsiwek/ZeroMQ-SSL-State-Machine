@@ -8,10 +8,10 @@ set(KEYS_FILE ${PROJECT_SOURCE_DIR}/server.pem)
 set(TEST_PORT 10000)
 
 add_executable(sm_server sm_server.c ${COMMON_SRC})
-target_link_libraries(sm_server ssl crypto)
+target_link_libraries(sm_server ssl crypto zmq)
 
 add_executable(sm_client sm_client.c ${COMMON_SRC})
-target_link_libraries(sm_client ssl crypto)
+target_link_libraries(sm_client ssl crypto zmq)
 
 add_custom_target(test_server
     COMMAND sm_server ${TEST_PORT} ${KEYS_FILE} ${KEYS_FILE}

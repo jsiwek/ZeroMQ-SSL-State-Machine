@@ -82,6 +82,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <zmq.h>
 
 #include "state_machine.h"
 
@@ -229,27 +230,31 @@ void SSLStateMachine_write_inject(SSLStateMachine *pMachine,
     fprintf(stderr,"%d bytes of unencrypted data fed to state machine\n",n);
     }
 
-void StateMachineEchoLoop(SSLStateMachine *pMachine, int socketFD)
+void StateMachineEchoLoop(SSLStateMachine *pMachine, void* zmqSocket)
     {
     unsigned char rbuf[1];
     int nrbuf = 0;
 
     for( ; ; )
     {
-    fd_set rfds,wfds;
     unsigned char buf[1024];
     int n;
+
+    zmq_pollitem_t pitems[3] = {
+        { 0, 0, ZMQ_POLLIN, 0 },          // stdin always selected for input
+        { 0, 1, 0, 0 },                   // stdout
+        { zmqSocket, -1, ZMQ_POLLIN, 0 }, // 0mq socket always select for input
+    };
+
+    unsigned int nitems = 3;
+    unsigned int stdinIdx = 0;
+    unsigned int stdoutIdx = 1;
+    unsigned int socketIdx = 2;
 
     if ( ! SSL_is_init_finished(pMachine->pSSL) )
         SSL_do_handshake(pMachine->pSSL);
 
     /* TODO: SSL_get_verify_result() should be used to validate peer certs. */
-
-    FD_ZERO(&rfds);
-    FD_ZERO(&wfds);
-
-    /* Select socket for input */
-    FD_SET(socketFD,&rfds);
 
     /* check whether there's decrypted data */
     if(!nrbuf)
@@ -257,35 +262,32 @@ void StateMachineEchoLoop(SSLStateMachine *pMachine, int socketFD)
 
     /* if there's decrypted data, check whether we can write it */
     if(nrbuf)
-        FD_SET(1,&wfds);
+        pitems[stdoutIdx].events = ZMQ_POLLOUT;
 
     /* Select socket for output */
     if(SSLStateMachine_write_can_extract(pMachine))
-        FD_SET(socketFD,&wfds);
-
-    /* Select stdin for input */
-    FD_SET(0,&rfds);
+        pitems[socketIdx].events |= ZMQ_POLLOUT;
 
     /* Wait for something to do something */
-    n=select(socketFD+1,&rfds,&wfds,NULL,NULL);
+    n = zmq_poll(pitems, nitems, -1);
     assert(n > 0);
 
     /* Socket is ready for input */
-    if(FD_ISSET(socketFD,&rfds))
+    if ( pitems[socketIdx].revents & ZMQ_POLLIN )
         {
-        n=read(socketFD,buf,sizeof buf);
-        if(n == 0)
-        {
-        fprintf(stderr,"Got EOF on socket\n");
-        exit(0);
-        }
-        assert(n > 0);
-
-        SSLStateMachine_read_inject(pMachine,buf,n);
+        zmq_msg_t msg;
+        zmq_msg_init(&msg);
+        zmq_recv(zmqSocket, &msg, 0);
+        n = zmq_msg_size(&msg);
+        unsigned char* msgbuf = malloc(n);
+        memcpy(msgbuf, zmq_msg_data(&msg), n);
+        zmq_msg_close(&msg);
+        SSLStateMachine_read_inject(pMachine, msgbuf, n);
+        free(msgbuf);
         }
 
     /* stdout is ready for output (and hence we have some to send it) */
-    if(FD_ISSET(1,&wfds))
+    if ( pitems[stdoutIdx].revents & ZMQ_POLLOUT )
         {
         assert(nrbuf == 1);
         buf[0]=rbuf[0];
@@ -310,20 +312,20 @@ void StateMachineEchoLoop(SSLStateMachine *pMachine, int socketFD)
         }
 
     /* Socket is ready for output (and therefore we have output to send) */
-    if(FD_ISSET(socketFD,&wfds))
+    if ( pitems[socketIdx].revents & ZMQ_POLLOUT )
         {
-        int w;
-
         n=SSLStateMachine_write_extract(pMachine,buf,sizeof buf);
         assert(n > 0);
 
-        w=write(socketFD,buf,n);
-        /* FIXME: we should push back any unwritten data */
-        assert(w == n);
+        zmq_msg_t msg;
+        zmq_msg_init_size(&msg, n);
+        memcpy(zmq_msg_data(&msg), buf, n);
+        zmq_send(zmqSocket, &msg, 0);
+        zmq_msg_close(&msg);
         }
 
     /* Stdin is ready for input */
-    if(FD_ISSET(0,&rfds))
+    if ( pitems[stdinIdx].revents & ZMQ_POLLIN )
         {
         n=read(0,buf,sizeof buf);
         if(n == 0)

@@ -1,0 +1,41 @@
+This was an incomplete/failed experiment in using OpenSSL as a state machine
+to complete a SSL/TLS handshake over a 0MQ socket.  In summary, the handshake
+can be completed for a single connection and app. data can be exchanged over
+SSL/TLS for the duration of that connection, but there lies a problem in
+detecting when a peer is disconnected[1][2] and thus requiring a new handshake
+upon reconnection.  In 0MQ, the 'tcp' transport is considered a "disconnected"
+TCP transport, meaning that the connectivity state of peers is transparent
+to applications.  So this reaffirms previous 0MQ security discussions[3] that
+possible approaches are:
+
+1) Tunneling 0MQ traffic over another channel that performs SSL in some fashion
+   (e.g. stunnel can work).  This relies on the user of the application to
+   be able to set this up, but you get SSL/TLS strength security for "free".
+
+2) Using a (currently non-existent) 0MQ transport implemented as some part
+   of the core 0MQ library to encrypt hop-by-hop.  If this existed, drawbacks
+   might be that it doesn't scale well to some of 0MQ's messaging patterns
+   and would need to be implemented differently for its supported unicast
+   vs. multicast transports.
+
+3) Adding a crypto layer at the application level to wrap messages with some
+   signing + encryption before sending them across the 0MQ socket.  In order
+   for this to provide security features that SSL/TLS offers beyond minimal
+   message authn., confidentiality, integrity, it needs to be able to use a
+   key-exchange algorithm (possibly PAKE), and some form of MAC'd nonce
+   (replay protection).  This doesn't seem worth the risk of rolling your own,
+   best wait until 0MQ core is taught to use a well-established protocol.
+
+[1] http://lists.zeromq.org/pipermail/zeromq-dev/2010-July/004230.html
+[2] http://lists.zeromq.org/pipermail/zeromq-dev/2010-August/005285.html
+[3] http://lists.zeromq.org/pipermail/zeromq-dev/2010-October/006562.html
+
+BUILDING THE CODE:
+# configure with CMake
+mkdir build; cd build; cmake ..
+# use the CMake-generated Makefile in build/
+make
+# start echo server
+make test_server
+# start echo client
+make test_client

@@ -36,6 +36,6 @@ int SSLStateMachine_write_extract(SSLStateMachine *pMachine,
 void SSLStateMachine_write_inject(SSLStateMachine *pMachine,
                                   const unsigned char *aucBuf, int nBuf);
 
-void StateMachineEchoLoop(SSLStateMachine *pMachine, int socketFD);
+void StateMachineEchoLoop(SSLStateMachine *pMachine, void* zmqSocket);
 
 #endif
